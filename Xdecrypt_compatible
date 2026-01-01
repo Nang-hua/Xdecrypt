@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Xdecrypt (NetSarang/Xshell/Xftp password decrypt helper)
+
+Changes vs original:
+- Works with either *pycryptodome* (Crypto.*) OR *pycryptodomex* (Cryptodome.*).
+- Gives a clear actionable error if neither is installed.
+- Avoids hard dependency on pywin32: will try pywin32 first, else fall back to `whoami /user`
+  (Windows only) to compute SID when -s/--sid is not provided.
+- Uses robust config parsing (handles UTF-16 / UTF-8 with BOM) and prints friendlier errors.
+
+Usage examples:
+  python Xdecrypt.py -s "usernameS-1-5-21-...-1001" -p "<base64>"
+  python Xdecrypt.py -p "C:\\Users\\you\\Documents\\NetSarang Computer\\7"
+"""
+
+import os
+import sys
+import argparse
+import base64
+import configparser
+import subprocess
+import re
+from typing import Optional
+
+# --- Crypto backend compatibility -------------------------------------------------
+def _load_crypto():
+    """
+    Try to load SHA256 and ARC4 from common crypto packages.
+
+    Preferred:
+      - pycryptodome:   from Crypto.Hash import SHA256 ; from Crypto.Cipher import ARC4
+      - pycryptodomex:  from Cryptodome.Hash import SHA256 ; from Cryptodome.Cipher import ARC4
+    """
+    try:
+        from Crypto.Hash import SHA256  # type: ignore
+        from Crypto.Cipher import ARC4  # type: ignore
+        return SHA256, ARC4, "pycryptodome(Crypto.*)"
+    except Exception:
+        try:
+            from Cryptodome.Hash import SHA256  # type: ignore
+            from Cryptodome.Cipher import ARC4  # type: ignore
+            return SHA256, ARC4, "pycryptodomex(Cryptodome.*)"
+        except Exception as e:
+            raise ImportError(
+                "Missing crypto dependency.\n"
+                "Install ONE of the following:\n"
+                "  pip install pycryptodome\n"
+                "  pip install pycryptodomex\n"
+                "Then rerun.\n"
+            ) from e
+
+SHA256, ARC4, _CRYPTO_BACKEND = _load_crypto()
+
+# --- SID helpers ------------------------------------------------------------------
+def _whoami_user_sid() -> Optional[str]:
+    """Return current user's SID string via `whoami /user` (Windows), else None."""
+    try:
+        out = subprocess.check_output(["whoami", "/user"], text=True, errors="ignore")
+        # Typical output contains a line like: USER INFORMATION ... <username> <SID>
+        # We'll grab last SID-looking token.
+        m = re.search(r"(S-\d-\d+-(?:\d+-){1,}\d+)", out)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+def _get_username() -> str:
+    # os.getlogin can fail in some contexts; be defensive.
+    return os.environ.get("USERNAME") or os.environ.get("USER") or "UnknownUser"
+
+def _get_sid_pywin32() -> Optional[str]:
+    """Return current user's SID string using pywin32 if available."""
+    try:
+        from win32api import GetComputerName, GetUserName  # type: ignore
+        from win32security import LookupAccountName, ConvertSidToStringSid  # type: ignore
+        return ConvertSidToStringSid(LookupAccountName(GetComputerName(), GetUserName())[0])
+    except Exception:
+        return None
+
+def _build_default_sid_string(config_path: str, v7_path: str) -> str:
+    """
+    Build the `username + SID` string used as key.
+    Original logic:
+      - v6: username + SID
+      - v7: (reversed username + SID) reversed == SID + username? (kept identical behavior)
+    """
+    username = _get_username()
+    sid = _get_sid_pywin32() or _whoami_user_sid()
+    if not sid:
+        raise RuntimeError(
+            "Could not determine current user's SID automatically.\n"
+            "Please provide it explicitly with -s/--sid.\n"
+            "You can get it via: whoami /user\n"
+        )
+
+    if os.path.abspath(config_path) == os.path.abspath(v7_path):
+        # Preserve the original trick for version 7
+        tmp = username[::-1] + sid
+        return tmp[::-1]
+    return username + sid
+
+# --- Decrypt ----------------------------------------------------------------------
+def decrypt_string(key_string: str, b64_cipher: str) -> Optional[str]:
+    """
+    Decrypt the NetSarang stored password.
+
+    The blob layout (as used by existing public implementations):
+      data || sha256(plain)
+    """
+    v1 = base64.b64decode(b64_cipher)
+    if len(v1) <= 0x20:
+        return None
+    cipher = ARC4.new(SHA256.new(key_string.encode("ascii")).digest())
+    plain = cipher.decrypt(v1[:-0x20])
+    if SHA256.new(plain).digest() == v1[-32:]:
+        try:
+            return plain.decode("ascii")
+        except UnicodeDecodeError:
+            # Some passwords may not be strict ASCII; fall back safely.
+            return plain.decode("utf-8", errors="replace")
+    return None
+
+def _read_cfg(filepath: str) -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    # Try common encodings in order.
+    for enc in (None, "utf-16", "utf-8-sig", "utf-8"):
+        try:
+            if enc is None:
+                cfg.read(filepath)
+            else:
+                cfg.read(filepath, encoding=enc)
+            return cfg
+        except UnicodeDecodeError:
+            continue
+    # Last resort: binary read then decode best-effort
+    with open(filepath, "rb") as f:
+        data = f.read()
+    text = data.decode("utf-8", errors="replace")
+    cfg.read_string(text)
+    return cfg
+
+def main() -> int:
+    VERSION_6_CONFIG_PATH = os.path.join(os.environ.get("USERPROFILE", ""), r"Documents\NetSarang Computer\6")
+    VERSION_7_CONFIG_PATH = os.path.join(os.environ.get("USERPROFILE", ""), r"Documents\NetSarang Computer\7")
+
+    parser = argparse.ArgumentParser(description="xsh, xfp password decrypt (compatible)")
+    parser.add_argument("-s", "--sid", default="", type=str,
+                        help="`username`+`sid` (SID from `whoami /user`). If omitted, will try to auto-detect.")
+    parser.add_argument("-p", "--password", default="", type=str,
+                        help="Either: base64 password string OR a sessions directory path")
+    parser.add_argument("--debug", action="store_true", help="print debug info")
+
+    args = parser.parse_args()
+
+    config_path = ""
+    if not args.password:
+        if os.path.exists(VERSION_6_CONFIG_PATH):
+            config_path = VERSION_6_CONFIG_PATH
+        elif os.path.exists(VERSION_7_CONFIG_PATH):
+            config_path = VERSION_7_CONFIG_PATH
+        else:
+            print("Error: can't find a valid NetSarang session path (6/7). Provide -p with your sessions folder.")
+            return 1
+        args.password = config_path
+    else:
+        # If user provided a directory, we treat it as session root.
+        if os.path.isdir(args.password):
+            config_path = args.password
+
+    if not args.sid:
+        try:
+            args.sid = _build_default_sid_string(config_path or VERSION_6_CONFIG_PATH, VERSION_7_CONFIG_PATH)
+        except Exception as e:
+            print(f"Error: {e}")
+            return 1
+
+    if args.debug:
+        print(f"[debug] crypto_backend={_CRYPTO_BACKEND}")
+        print(f"[debug] sid_key={args.sid}")
+        if config_path:
+            print(f"[debug] session_path={config_path}")
+
+    # If -p is not a directory, treat it as base64 cipher and decrypt directly.
+    if not os.path.isdir(args.password):
+        r = decrypt_string(args.sid, args.password)
+        if r is None:
+            print("Decrypt failed (bad SID/key? bad base64? or data corrupted).")
+            return 2
+        print(r)
+        return 0
+
+    # Walk session files
+    for root, _, files in os.walk(args.password):
+        for f in files:
+            if not (f.endswith(".xsh") or f.endswith(".xfp")):
+                continue
+            filepath = os.path.join(root, f)
+            try:
+                cfg = _read_cfg(filepath)
+                if f.endswith(".xsh"):
+                    host = f"{cfg['CONNECTION']['Host']}:{cfg['CONNECTION']['Port']}"
+                    username = cfg["CONNECTION:AUTHENTICATION"].get("UserName", "")
+                    password_b64 = cfg["CONNECTION:AUTHENTICATION"].get("Password", "")
+                else:
+                    host = f"{cfg['Connection']['Host']}:{cfg['Connection']['Port']}"
+                    username = cfg["Connection"].get("UserName", "")
+                    password_b64 = cfg["Connection"].get("Password", "")
+
+                password = decrypt_string(args.sid, password_b64) if password_b64 else None
+                print(f"{filepath:=^100}\nHost:     {host}\nUsername: {username}\nPassword: {password}")
+            except Exception as e:
+                print(f"{filepath:=^100}\nError: {e}")
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())
